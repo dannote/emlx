@@ -681,6 +681,89 @@ NIF(cumulative_min) {
     TENSOR(mlx::core::NATIVE_OP(*a, *b, device));                              \
   }
 
+// Class to hold an arbitrary Erlang term in a resource.
+struct TermHolder {
+  ErlNifEnv *env;
+  ERL_NIF_TERM term;
+
+  TermHolder(ErlNifEnv *env, ERL_NIF_TERM term) : env(enif_alloc_env()) {
+    this->term = enif_make_copy(this->env, term);
+  }
+
+  ~TermHolder() { enif_free_env(this->env); }
+};
+
+NIF(wrap_term) {
+  TermHolder *holder = (TermHolder *)enif_alloc_resource(
+      resource_object<TermHolder>::type, sizeof(TermHolder));
+
+  if (holder == NULL)
+    return enif_make_badarg(env);
+
+  new (holder) TermHolder(env, argv[0]);
+
+  ERL_NIF_TERM ret = enif_make_resource(env, holder);
+  enif_release_resource(holder);
+
+  return ret;
+}
+
+NIF(unwrap_term) {
+  TermHolder *holder;
+  if (!enif_get_resource(env, argv[0], resource_object<TermHolder>::type,
+                         (void **)&holder)) {
+    return enif_make_badarg(env);
+  }
+
+  return enif_make_copy(env, holder->term);
+}
+
+// Global atom for the cleaner process name
+ERL_NIF_TERM ATOM_EMLX_CLEANER;
+
+// Struct to hold the key for persistent_term/ETS cleanup
+struct CleanupKey {
+  ErlNifEnv *env;
+  ERL_NIF_TERM key;
+
+  CleanupKey(ErlNifEnv *env, ERL_NIF_TERM key) : env(enif_alloc_env()) {
+    this->key = enif_make_copy(this->env, key);
+  }
+
+  ~CleanupKey() {
+    // Send a message to the cleaner process
+    // The message format is: {:cleanup, key}
+    // We need to create a temporary environment to send the message
+    ErlNifEnv *msg_env = enif_alloc_env();
+    ERL_NIF_TERM msg_key = enif_make_copy(msg_env, this->key);
+    ERL_NIF_TERM msg_atom = enif_make_atom(msg_env, "cleanup");
+    ERL_NIF_TERM msg = enif_make_tuple2(msg_env, msg_atom, msg_key);
+
+    ErlNifPid pid;
+    if (enif_whereis_pid(msg_env, ATOM_EMLX_CLEANER, &pid)) {
+      enif_send(NULL, &pid, msg_env, msg);
+    }
+
+    enif_free_env(msg_env);
+    enif_free_env(this->env);
+  }
+};
+
+NIF(wrap_cleanup_key) {
+  CleanupKey *holder = (CleanupKey *)enif_alloc_resource(
+      resource_object<CleanupKey>::type, sizeof(CleanupKey));
+
+  if (holder == NULL)
+    return enif_make_badarg(env);
+
+  new (holder) CleanupKey(env, argv[0]);
+
+  ERL_NIF_TERM ret = enif_make_resource(env, holder);
+  enif_release_resource(holder);
+
+  return ret;
+}
+
 static int open_resources(ErlNifEnv *env) {
   const char *mod = "EMLX";
   if (!open_resource<mlx::core::array>(env, mod, "MLXArray")) {
@@ -690,6 +773,18 @@ static int open_resources(ErlNifEnv *env) {
   if (!open_resource<emlx::function>(env, mod, "CompiledFunction")) {
     return -1;
   }
+
+  // Create a new resource type for holding terms.
+  if (!open_resource<TermHolder>(env, mod, "TermHolder")) {
+    return -1;
+  }
+
+  // Create a new resource type for cleanup keys.
+  if (!open_resource<CleanupKey>(env, mod, "CleanupKey")) {
+    return -1;
+  }
+
+  ATOM_EMLX_CLEANER = enif_make_atom(env, "Elixir.EMLX.Cleaner");
 
   return 0;
 }
@@ -1087,8 +1182,10 @@ static ErlNifFunc nif_funcs[] = {
     {"max", 4, max},
     {"min", 4, min},
     {"clip", 4, clip},
-    {"tri_inv", 3, tri_inv}
-};
+    {"tri_inv", 3, tri_inv},
+    {"wrap_term", 1, wrap_term},
+    {"unwrap_term", 1, unwrap_term},
+    {"wrap_cleanup_key", 1, wrap_cleanup_key}};
 
 // Update the NIF initialization
 ERL_NIF_INIT(Elixir.EMLX.NIF, nif_funcs, load, NULL, upgrade, NULL)

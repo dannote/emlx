@@ -326,10 +326,34 @@ defmodule EMLX do
   @behaviour Nx.Defn.Compiler
 
   @impl Nx.Defn.Compiler
-  defdelegate __jit__(key, vars, fun, args_list, opts), to: Nx.Defn.Evaluator
+  def __jit__(key, vars, fun, args_list, opts) do
+    fun = __compile__(key, vars, fun, opts)
+    fun.(args_list)
+  end
 
   @impl Nx.Defn.Compiler
-  defdelegate __compile__(key, vars, fun, opts), to: Nx.Defn.Evaluator
+  def __compile__(key, vars, fun, opts) do
+    # Delegate to Evaluator for the actual compilation (pre-calculation of the graph)
+    compiled_fun = Nx.Defn.Evaluator.__compile__(key, vars, fun, opts)
+
+    # Store the compiled function in persistent_term for fast access without copying.
+    # We create a unique reference as the key.
+    key = make_ref()
+    :persistent_term.put(key, compiled_fun)
+
+    # Wrap the key in a NIF resource that will trigger cleanup when destroyed.
+    # The resource's destructor sends a message to EMLX.Cleaner to delete the key.
+    cleanup_resource = EMLX.NIF.wrap_cleanup_key(key)
+
+    # Return a lightweight wrapper that fetches the function from persistent_term.
+    # The cleanup resource is captured in the closure, so it lives as long as the closure.
+    fn args ->
+      # We must capture the cleanup resource to keep it alive
+      _ = cleanup_resource
+      stored_fun = :persistent_term.get(key)
+      stored_fun.(args)
+    end
+  end
 
   @impl Nx.Defn.Compiler
   defdelegate __partitions_options__(opts), to: Nx.Defn.Evaluator

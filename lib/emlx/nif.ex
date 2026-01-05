@@ -24,4 +24,16 @@ defmodule EMLX.NIF do
   def to_blob(_tensor, _limit) do
     :erlang.nif_error(:nif_not_loaded)
   end
+
+  def wrap_term(_term) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def unwrap_term(_resource) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def wrap_cleanup_key(_key) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
 end
