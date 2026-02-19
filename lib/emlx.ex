@@ -326,10 +326,174 @@ defmodule EMLX do
   @behaviour Nx.Defn.Compiler
 
   @impl Nx.Defn.Compiler
-  defdelegate __jit__(key, vars, fun, args_list, opts), to: Nx.Defn.Evaluator
+  def __jit__(key, vars, fun, args_list, opts) do
+    __compile__(key, vars, fun, opts).(args_list)
+  end
 
   @impl Nx.Defn.Compiler
-  defdelegate __compile__(key, vars, fun, opts), to: Nx.Defn.Evaluator
+  def __compile__(key, vars, fun, opts) do
+    backend = Nx.default_backend()
+
+    target_backend =
+      case backend do
+        EMLX.Backend ->
+          backend
+
+        {EMLX.Backend, _} ->
+          backend
+
+        Nx.BinaryBackend ->
+          EMLX.Backend
+
+        {Nx.BinaryBackend, _} ->
+          EMLX.Backend
+
+        other ->
+          raise ArgumentError,
+                "EMLX can only be used with the EMLX.Backend or Nx.BinaryBackend, got: #{inspect(other)}"
+      end
+
+    # Build the expression once with the vars
+    expr = fun.(vars)
+
+    fn [args] ->
+      # Extract MLX array references and determine device
+      {devices, nif_args} =
+        Enum.map(args, fn arg ->
+          case arg.() do
+            %Nx.Tensor{data: %EMLX.Backend{ref: {device, ref}}} ->
+              {device, ref}
+
+            %Nx.Tensor{data: %Nx.BinaryBackend{}} = t ->
+              %Nx.Tensor{data: %EMLX.Backend{ref: {device, ref}}} =
+                Nx.backend_copy(t, target_backend)
+
+              {device, ref}
+
+            other ->
+              %Nx.Tensor{data: %EMLX.Backend{ref: {device, ref}}} = Nx.to_tensor(other)
+              {device, ref}
+          end
+        end)
+        |> Enum.unzip()
+
+      device =
+        Enum.reduce_while(devices, :cpu, fn
+          :gpu, _ -> {:halt, :gpu}
+          _, acc -> {:cont, acc}
+        end)
+
+      cache_key = {__MODULE__, :compiled_fun, key}
+
+      compiled_fun =
+        case :persistent_term.get(cache_key, :not_found) do
+          :not_found ->
+            eval_fun = Nx.Defn.Evaluator.__compile__(key, vars, fun, opts)
+
+            # Start a task for compilation, keeping eval_fun in the caller process
+            # to avoid copying large closures across process boundaries.
+            caller_pid = self()
+
+            task =
+              Task.async(fn ->
+                callback = fn {refs} ->
+                  callback_ref = make_ref()
+                  runner_pid = self()
+
+                  send(caller_pid, {:eval_defn, callback_ref, refs, device, runner_pid})
+
+                  receive do
+                    {:eval_result, ^callback_ref, result_refs} -> result_refs
+                  after
+                    5_000 -> raise "Timeout waiting for eval_defn result"
+                  end
+                end
+
+                tag = EMLX.Runner.register(EMLX.Runner, callback)
+
+                try do
+                  nif_compile(nif_args, tag)
+                after
+                  EMLX.Runner.unregister(EMLX.Runner, tag)
+                end
+              end)
+
+            compiled = await_with_eval_handler(task, eval_fun, device)
+            :persistent_term.put(cache_key, compiled)
+            compiled
+
+          cached_fun ->
+            cached_fun
+        end
+
+      nif_result =
+        case device do
+          :cpu -> EMLX.NIF.call_compiled_cpu(compiled_fun, nif_args)
+          :gpu -> EMLX.NIF.call_compiled_gpu(compiled_fun, nif_args)
+        end
+
+      results =
+        nif_result
+        |> unwrap!()
+        |> Enum.map(fn ref -> EMLX.Backend.to_nx({device, ref}) end)
+
+      {result, []} =
+        Nx.Defn.Composite.traverse(expr, results, fn _node, [h | t] ->
+          {h, t}
+        end)
+
+      [result]
+    end
+  end
+
+  defp await_with_eval_handler(%Task{ref: task_ref} = task, eval_fun, device) do
+    monitor_ref = Process.monitor(task.pid)
+    result = await_with_eval_loop(task, eval_fun, device, task_ref, monitor_ref)
+    Process.demonitor(monitor_ref, [:flush])
+    result
+  end
+
+  defp await_with_eval_loop(task, eval_fun, device, task_ref, monitor_ref) do
+    receive do
+      {:eval_defn, callback_ref, refs, ^device, reply_to} ->
+        arg_list =
+          Enum.map(refs, fn ref ->
+            fn -> EMLX.Backend.to_nx({device, ref}) end
+          end)
+
+        result = eval_fun.([arg_list])
+
+        result_refs =
+          result
+          |> Nx.Defn.Composite.flatten_list()
+          |> Enum.map(fn %Nx.Tensor{data: %{ref: {_device, ref}}} -> ref end)
+
+        send(reply_to, {:eval_result, callback_ref, result_refs})
+        await_with_eval_loop(task, eval_fun, device, task_ref, monitor_ref)
+
+      {:DOWN, ^monitor_ref, :process, _pid, :normal} ->
+        await_with_eval_loop(task, eval_fun, device, task_ref, monitor_ref)
+
+      {:DOWN, ^monitor_ref, :process, _pid, reason} ->
+        raise "Task failed: #{inspect(reason)}"
+
+      {:EXIT, _pid, reason} ->
+        raise "Task exited: #{inspect(reason)}"
+
+      {^task_ref, result} ->
+        result
+    after
+      5_000 ->
+        Task.shutdown(task, :brutal_kill)
+        raise "Timeout waiting for compilation"
+    end
+  end
+
+  defp nif_compile(nif_args, tag) do
+    nif_args
+    |> EMLX.NIF.compile(tag)
+    |> unwrap!()
+  end
 
   @impl Nx.Defn.Compiler
   defdelegate __partitions_options__(opts), to: Nx.Defn.Evaluator
